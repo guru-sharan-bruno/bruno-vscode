@@ -5,6 +5,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
+import { runCommand } from '../page/actions';
 
 // This file lives at tests/e2e/utils/fixtures/, so climb four levels to the repo root.
 const EXTENSION_ROOT = path.resolve(__dirname, '../../../..');
@@ -153,12 +154,7 @@ async function ensureSecondarySidebarClosed(page: Page): Promise<void> {
   const auxiliaryBar = page.locator('.part.auxiliarybar');
   const isVisible = await auxiliaryBar.isVisible().catch(() => false);
   if (!isVisible) return;
-
-  await page.keyboard.press('F1');
-  await page.waitForSelector('.quick-input-widget').catch(() => {});
-  await page.keyboard.type('View: Close Secondary Side Bar');
-  await page.keyboard.press('Enter');
-
+  await runCommand(page, 'View: Close Secondary Side Bar');
   await auxiliaryBar.waitFor({ state: 'hidden'}).catch(() => {});
 }
 
