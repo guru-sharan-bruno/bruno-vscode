@@ -2759,18 +2759,19 @@ export const collectionAddEnvFileEvent = (payload: any) => (dispatch: any, getSt
       return reject(new Error('Collection not found'));
     }
 
-    environmentSchema
-      .validate(environment)
-      .then(() =>
-        dispatch(
-          _collectionAddEnvFileEvent({
-            environment,
-            collectionUid: meta.collectionUid
-          })
-        )
-      )
-      .then(resolve)
-      .catch(reject);
+    // Validate synchronously so the environment is in the store before any following event is handled
+    try {
+      environmentSchema.validateSync(environment);
+      dispatch(
+        _collectionAddEnvFileEvent({
+          environment,
+          collectionUid: meta.collectionUid
+        })
+      );
+      resolve(undefined);
+    } catch (error) {
+      reject(error);
+    }
   });
 };
 
