@@ -4,21 +4,24 @@
  */
 
 import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse, AxiosError, InternalAxiosRequestConfig } from 'axios';
+import { NtlmClient, type NtlmCredentials } from 'axios-ntlm';
 import FormData from 'form-data';
 import https from 'https';
 import { URL } from 'url';
+import { isSameOrigin } from '@usebruno/common/utils';
 import type { NetworkLogEntry } from '@bruno-types';
 import { getCookieStringForUrl, saveCookies } from '../../utils/cookies';
 import { preferencesUtil } from '../../store/preferences';
 import { safeStringifyJSON } from '../../utils/common';
 import { MultipartField, createFormData, formatMultipartData } from '../../utils/form-data';
 import { createConnectionLoggingTransport, sslValidationMessage } from './connection-log';
-import type { CACertificatesCount } from './cert-utils';
+import type { CACertificatesCount, CertsAndProxyConfigResult } from './cert-utils';
 
 // Import digest auth helper using require due to type declaration issues in @usebruno/requests
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { addDigestInterceptor } = require('@usebruno/requests') as {
+const { addDigestInterceptor, handleNtlmRedirect } = require('@usebruno/requests') as {
   addDigestInterceptor: (axiosInstance: AxiosInstance, request: { digestConfig: { username?: string; password?: string } }) => void;
+  handleNtlmRedirect: (requestConfig: AxiosRequestConfig, fromUrl: string, redirectUrl: string, forwardAuthorizationHeader: boolean) => void;
 };
 
 const redirectResponseCodes = [301, 302, 303, 307, 308];
@@ -88,6 +91,11 @@ interface AxiosInstanceOptions {
     username?: string;
     password?: string;
   };
+  ntlmConfig?: {
+    username: string;
+    password: string;
+    domain?: string;
+  };
   collectionPath?: string;
   disableCookies?: boolean;
   timeline?: NetworkLogEntry[];
@@ -103,26 +111,40 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
     proxyConfig,
     requestMaxRedirects = 5,
     digestConfig,
+    ntlmConfig,
     collectionPath,
     disableCookies,
     timeline
   } = options;
 
-  const { ca, cert, key, pfx, passphrase, rejectUnauthorized, caCertificatesCount, ...restAgentOptions } = httpsAgentOptions as Record<string, unknown>;
+  const { ca, cert, key, pfx, passphrase, rejectUnauthorized, caCertificatesCount } = httpsAgentOptions as Record<string, unknown>;
 
-  // TODO: Properly handle certificates. VS Code's @vscode/proxy-agent patches
-  // https.request and overrides agent TLS settings. As a workaround, we disable
-  // TLS verification at the process level for now.
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
-  const agentOpts: https.AgentOptions = {
-    keepAlive: true,
-    rejectUnauthorized: false,
+  // VS Code's @vscode/proxy-agent replaces the agent under http.proxySupport=override (the default),
+  // dropping agent-level TLS options. Request-level options survive, so the transport sets these on each request.
+  const tlsOptions: https.AgentOptions = {
+    rejectUnauthorized: rejectUnauthorized !== false,
+    ...(ca !== undefined && { ca: ca as string | string[] }),
     ...(cert !== undefined && { cert: cert as string | Buffer }),
     ...(key !== undefined && { key: key as string | Buffer }),
     ...(pfx !== undefined && { pfx: pfx as string | Buffer }),
     ...(passphrase !== undefined && { passphrase: passphrase as string }),
   };
+
+  const log = (type: NetworkLogEntry['type'], message?: string): void => {
+    timeline?.push({ timestamp: new Date(), type, message });
+  };
+
+  const proxyModeMessage = proxyMode === 'on' && proxyConfig
+    ? `Proxy mode: on | ${proxyConfig.protocol || 'http'}://${proxyConfig.hostname}${proxyConfig.port ? `:${proxyConfig.port}` : ''}`
+    : `Proxy mode: ${proxyMode}`;
+
+  const connectionLoggingTransport = createConnectionLoggingTransport({
+    log,
+    timeout,
+    caCertificatesCount: caCertificatesCount as Partial<CACertificatesCount> | undefined,
+    proxyModeMessage,
+    tlsOptions
+  });
 
   const config: AxiosRequestConfig = {
     timeout,
@@ -131,7 +153,9 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
     maxRedirects: 0,
     responseType: 'stream',
     proxy: false,
-    httpsAgent: new https.Agent(agentOpts),
+    httpsAgent: new https.Agent({ keepAlive: true, ...tlsOptions }),
+    // Also used without a timeline, where `log` is a no-op, so TLS options apply to every request.
+    transport: connectionLoggingTransport,
     headers: {
       'User-Agent': 'bruno-runtime/1.0',
       // VS Code's proxy agent drops the agent above, and Node's global agent sends `Connection: close`.
@@ -155,10 +179,6 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
 
   const instance = axios.create(config);
 
-  const log = (type: NetworkLogEntry['type'], message?: string): void => {
-    timeline?.push({ timestamp: new Date(), type, message });
-  };
-
   const logResponseHeaders = (headers: Record<string, unknown>, elapsedMs: number): void => {
     Object.entries(headers || {}).forEach(([name, value]) => {
       log('responseHeader', `${name}: ${value}`);
@@ -166,20 +186,8 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
     log('responseHeader', `request-duration: ${elapsedMs}`);
   };
 
-  const proxyModeMessage = proxyMode === 'on' && proxyConfig
-    ? `Proxy mode: on | ${proxyConfig.protocol || 'http'}://${proxyConfig.hostname}${proxyConfig.port ? `:${proxyConfig.port}` : ''}`
-    : `Proxy mode: ${proxyMode}`;
-
   const shouldSendCookies = () => !disableCookies && preferencesUtil.shouldSendCookies();
   const shouldStoreCookies = () => !disableCookies && preferencesUtil.shouldStoreCookies();
-
-  const connectionLoggingTransport = createConnectionLoggingTransport({
-    log,
-    timeout,
-    rejectUnauthorized: agentOpts.rejectUnauthorized,
-    caCertificatesCount: caCertificatesCount as Partial<CACertificatesCount> | undefined,
-    proxyModeMessage
-  });
 
   instance.interceptors.request.use((requestConfig: InternalAxiosRequestConfig) => {
     const startTime = Date.now();
@@ -298,6 +306,20 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
           headers: { ...originalRequest.headers }
         };
 
+        if (originalRequest.url) {
+          handleNtlmRedirect(requestConfig, originalRequest.url, redirectUrl, true);
+        }
+        
+        if (!isSameOrigin(originalRequest.url || '', redirectUrl)) {
+          for (const name of Object.keys(requestConfig.headers || {})) {
+            // Header names starting with x-amz- (any case), such as X-Amz-Date and X-Amz-Security-Token, belong to the AWS signature
+            if (/^x-amz-/i.test(name)) {
+              delete (requestConfig.headers as Record<string, unknown>)[name];
+            }
+          }
+          (requestConfig as { __skipAwsV4Sign?: boolean }).__skipAwsV4Sign = true;
+        }
+
         const statusCode = error.response.status;
         const originalMethod = (originalRequest.method || 'get').toLowerCase();
 
@@ -342,7 +364,7 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
         // Repeated once more by the transport, as the desktop app does for every hop.
         log('info', proxyModeMessage);
         if (/^https:/i.test(redirectUrl)) {
-          log('info', sslValidationMessage(agentOpts.rejectUnauthorized));
+          log('info', sslValidationMessage(tlsOptions.rejectUnauthorized));
         }
 
         return instance(requestConfig);
@@ -357,8 +379,41 @@ const createAxiosInstance = (options: AxiosInstanceOptions = {}): AxiosInstance 
     addDigestInterceptor(instance, { digestConfig });
   }
 
+  if (ntlmConfig) {
+    const credentials: NtlmCredentials = {
+      username: ntlmConfig.username,
+      password: ntlmConfig.password,
+      domain: ntlmConfig.domain || ''
+    };
+    const ntlmClient = NtlmClient(credentials, {});
+    instance.defaults.adapter = (requestConfig) => ntlmClient.request({
+      ...requestConfig,
+      headers: { ...requestConfig.headers },
+      adapter: axios.getAdapter('http')
+    });
+  }
+
   return instance;
 };
+
+/** The TLS and proxy options of `createAxiosInstance`, from the result of `getCertsAndProxyConfig`. */
+const axiosOptionsFromCertsAndProxyConfig = ({
+  httpsAgentRequestFields,
+  proxyMode,
+  proxyConfig
+}: CertsAndProxyConfigResult): Pick<AxiosInstanceOptions, 'httpsAgentOptions' | 'proxyMode' | 'proxyConfig'> => ({
+  httpsAgentOptions: { ...httpsAgentRequestFields },
+  proxyMode,
+  proxyConfig: proxyMode === 'on' ? {
+    protocol: proxyConfig.protocol,
+    hostname: proxyConfig.hostname,
+    port: proxyConfig.port || undefined,
+    auth: proxyConfig.auth ? {
+      username: proxyConfig.auth.username,
+      password: proxyConfig.auth.password
+    } : undefined
+  } : undefined
+});
 
 /**
  * Make a request using a fresh axios instance
@@ -374,6 +429,7 @@ const makeRequest = async (
 export default createAxiosInstance;
 export {
   createAxiosInstance,
+  axiosOptionsFromCertsAndProxyConfig,
   makeRequest,
   AxiosInstanceOptions
 };
